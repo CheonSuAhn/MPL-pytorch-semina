@@ -173,32 +173,44 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         targets = targets.to(args.device)
         with amp.autocast(enabled=args.amp):
             batch_size = images_l.shape[0]
-            t_images = torch.cat((images_l, images_uw, images_us))
-            t_logits = teacher_model(t_images)
-            t_logits_l = t_logits[:batch_size]
-            t_logits_uw, t_logits_us = t_logits[batch_size:].chunk(2)
+            # merge training images composed of labeled images and unlabeled images(weak_aug and strong_aug)
+            t_images = torch.cat((images_l, images_uw, images_us))  # size : batchsize * 3
+            t_logits = teacher_model(t_images)  # compute predictions of teacher model => soft pseudo labels
+            t_logits_l = t_logits[:batch_size]  # extract predictions of teacher model on labeled data
+            t_logits_uw, t_logits_us = t_logits[batch_size:].chunk(2) # extract soft peusdo labels on unlabeled data (weak and strong aug)
             del t_logits
-
-            t_loss_l = criterion(t_logits_l, targets)
-
-            soft_pseudo_label = torch.softmax(t_logits_uw.detach()/args.temperature, dim=-1)
+            
+            # supervised loss with teacher model (fintuning loss)
+            t_loss_l = criterion(t_logits_l, targets) # cross entropy loss between 
+            
+            # generate soft psuedo label with teacher model on unlabeled data(weak augmentation)
+            soft_pseudo_label = torch.softmax(t_logits_uw.detach()/args.temperature, dim=-1) # use temperature for sharpening the distribution
+            # generate hard pseudo label using max sampling
             max_probs, hard_pseudo_label = torch.max(soft_pseudo_label, dim=-1)
+            # make mask for max_prob greater than or equal to threshold
             mask = max_probs.ge(args.threshold).float()
+            
+            # UDA loss for teacher model (unsupervised loss)
+            # compute cross entropy loss between predictions on weak_augmented images and strong_augmented images
             t_loss_u = torch.mean(
-                -(soft_pseudo_label * torch.log_softmax(t_logits_us, dim=-1)).sum(dim=-1) * mask
+                -(soft_pseudo_label * torch.log_softmax(t_logits_us, dim=-1)).sum(dim=-1) * mask # the reason using mask is to compute the loss for predictons of high confidence
             )
-            weight_u = args.lambda_u * min(1., (step+1) / args.uda_steps)
+            weight_u = args.lambda_u * min(1., (step+1) / args.uda_steps) # warmup lambda_u until uda_steps
             t_loss_uda = t_loss_l + weight_u * t_loss_u
-
-            s_images = torch.cat((images_l, images_us))
-            s_logits = student_model(s_images)
-            s_logits_l = s_logits[:batch_size]
-            s_logits_us = s_logits[batch_size:]
+            
+            s_images = torch.cat((images_l, images_us)) # merge images composed of labeled images and unlabeled images(weak_aug)
+            s_logits = student_model(s_images) # compute the prediction on merged images with student model
+            s_logits_l = s_logits[:batch_size]  # extract predictions of student model on labeled images
+            s_logits_us = s_logits[batch_size:] # extract predictions of student model on unlabeled images
             del s_logits
-
+          
+            # compute the cross entropy loss on labeled image of old student model to approximate dot product using tylor series
             s_loss_l_old = F.cross_entropy(s_logits_l.detach(), targets)
+            
+            # psuedo label loss for student parameter update using hard psuedo labels from teacher model
             s_loss = criterion(s_logits_us, hard_pseudo_label)
-
+        
+        # update the student's parameter using pseudo label loss
         s_scaler.scale(s_loss).backward()
         if args.grad_clip > 0:
             s_scaler.unscale_(s_optimizer)
@@ -210,16 +222,13 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             avg_student_model.update_parameters(student_model)
 
         with amp.autocast(enabled=args.amp):
+            # compute the prediction of new student model on labeled images
             with torch.no_grad():
                 s_logits_l = student_model(images_l)
-            s_loss_l_new = F.cross_entropy(s_logits_l.detach(), targets)
-            # dot_product = s_loss_l_new - s_loss_l_old
-            # test
-            dot_product = s_loss_l_old - s_loss_l_new
-            # moving_dot_product = moving_dot_product * 0.99 + dot_product * 0.01
-            # dot_product = dot_product - moving_dot_product
-            _, hard_pseudo_label = torch.max(t_logits_us.detach(), dim=-1)
-            t_loss_mpl = dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label)
+            s_loss_l_new = F.cross_entropy(s_logits_l.detach(), targets)  # compute the loss on labeled image with new student model
+            dot_product = s_loss_l_old - s_loss_l_new # approximate dot product using tylor series
+            _, hard_pseudo_label = torch.max(t_logits_us.detach(), dim=-1)  # generate hard pseudo label from teacher's predictions by using max sampling
+            t_loss_mpl = dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label)  # compute the MPL loss
             t_loss = t_loss_uda + t_loss_mpl
 
         t_scaler.scale(t_loss).backward()
@@ -240,14 +249,16 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             t_loss_u = reduce_tensor(t_loss_u.detach(), args.world_size)
             t_loss_mpl = reduce_tensor(t_loss_mpl.detach(), args.world_size)
             mask = reduce_tensor(mask, args.world_size)
-
+        
+        # loss update
         s_losses.update(s_loss.item())
         t_losses.update(t_loss.item())
         t_losses_l.update(t_loss_l.item())
         t_losses_u.update(t_loss_u.item())
         t_losses_mpl.update(t_loss_mpl.item())
         mean_mask.update(mask.mean().item())
-
+         
+        # record the result of training
         batch_time.update(time.time() - end)
         pbar.set_description(
             f"Train Iter: {step+1:3}/{args.total_steps:3}. "
@@ -258,7 +269,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         if args.local_rank in [-1, 0]:
             args.writer.add_scalar("lr", get_lr(s_optimizer), step)
             wandb.log({"lr": get_lr(s_optimizer)})
-
+        
+        # evaluate for each specified evaluation step
         args.num_eval = step//args.eval_step
         if (step+1) % args.eval_step == 0:
             pbar.close()
@@ -275,8 +287,10 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                            "train/4.t_unlabeled": t_losses_u.avg,
                            "train/5.t_mpl": t_losses_mpl.avg,
                            "train/6.mask": mean_mask.avg})
-
+                
+                # setting the test model to student model
                 test_model = avg_student_model if avg_student_model is not None else student_model
+                # compute the evaluation loss and accuracy (top1, top5) with student model
                 test_loss, top1, top5 = evaluate(args, test_loader, test_model, criterion)
 
                 args.writer.add_scalar("test/loss", test_loss, args.num_eval)
@@ -285,7 +299,7 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                 wandb.log({"test/loss": test_loss,
                            "test/acc@1": top1,
                            "test/acc@5": top5})
-
+                # check if the accuracy is the best
                 is_best = top1 > args.best_top1
                 if is_best:
                     args.best_top1 = top1
@@ -293,7 +307,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
 
                 logger.info(f"top-1 acc: {top1:.2f}")
                 logger.info(f"Best top-1 acc: {args.best_top1:.2f}")
-
+                
+                # save the best model
                 save_checkpoint(args, {
                     'step': step + 1,
                     'teacher_state_dict': teacher_model.state_dict(),
@@ -312,7 +327,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
     if args.local_rank in [-1, 0]:
         args.writer.add_scalar("result/test_acc@1", args.best_top1)
         wandb.log({"result/test_acc@1": args.best_top1})
-    # finetune
+        
+    # additionally finetune with best teacher model on labeled data
     del t_scaler, t_scheduler, t_optimizer, teacher_model, unlabeled_loader
     del s_scaler, s_scheduler, s_optimizer
     ckpt_name = f'{args.save_path}/{args.name}_best.pth.tar'
@@ -326,7 +342,7 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
     finetune(args, labeled_loader, test_loader, student_model, criterion)
     return
 
-
+# evaluate with student model on test data
 def evaluate(args, test_loader, model, criterion):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -360,7 +376,7 @@ def evaluate(args, test_loader, model, criterion):
         test_iter.close()
         return losses.avg, top1.avg, top5.avg
 
-
+# finetune with trained teacher model on labeled data
 def finetune(args, train_loader, test_loader, model, criterion):
     train_sampler = RandomSampler if args.local_rank == -1 else DistributedSampler
     labeled_loader = DataLoader(
