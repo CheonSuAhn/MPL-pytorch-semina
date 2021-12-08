@@ -2,6 +2,9 @@
 This is an unofficial PyTorch implementation of [Meta Pseudo Labels](https://arxiv.org/abs/2003.10580).
 The official Tensorflow implementation is [here](https://github.com/google-research/google-research/tree/master/meta_pseudo_labels).
 
+## 코드 리뷰 Code Review
+코드 리뷰를 위해 코드에 대해 주석을 달았습니다.
+I've added the comment about the code for the code review
 
 ## Results
 
