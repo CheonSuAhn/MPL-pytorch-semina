@@ -120,14 +120,12 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         unlabeled_epoch = 0
         labeled_loader.sampler.set_epoch(labeled_epoch)
         unlabeled_loader.sampler.set_epoch(unlabeled_epoch)
-
+    
+    # use iter function to sample the batch from dataset for each step
     labeled_iter = iter(labeled_loader)
     unlabeled_iter = iter(unlabeled_loader)
 
-    # moving_dot_product = torch.empty(1).to(args.device)
-    # limit = 3.0**(0.5)  # 3 = 6 / (f_in + f_out)
-    # nn.init.uniform_(moving_dot_product, -limit, limit)
-
+    # training iteration
     for step in range(args.start_step, args.total_steps):
         if step % args.eval_step == 0:
             pbar = tqdm(range(args.eval_step), disable=args.local_rank not in [-1, 0])
@@ -139,11 +137,13 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             t_losses_u = AverageMeter()
             t_losses_mpl = AverageMeter()
             mean_mask = AverageMeter()
-
+        
+        # setting teacher and student model to train mode
         teacher_model.train()
         student_model.train()
         end = time.time()
-
+        
+        # sample the batch of images and labels from labeled dataset
         try:
             images_l, targets = labeled_iter.next()
         except:
@@ -152,7 +152,9 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                 labeled_loader.sampler.set_epoch(labeled_epoch)
             labeled_iter = iter(labeled_loader)
             images_l, targets = labeled_iter.next()
-
+        
+        # sample the batch of images from unlabeled dataset
+        # images_uw : weak-augmented image, images_us : strong-augmented image (random augmentation)
         try:
             (images_uw, images_us), _ = unlabeled_iter.next()
         except:
@@ -163,7 +165,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             (images_uw, images_us), _ = unlabeled_iter.next()
 
         data_time.update(time.time() - end)
-
+        
+        # move images and labels to the device(GPU)
         images_l = images_l.to(args.device)
         images_uw = images_uw.to(args.device)
         images_us = images_us.to(args.device)
