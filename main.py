@@ -481,7 +481,7 @@ def main():
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
     
-    # Dataset setting
+    # Dataset setting (dafault : cifar10)
     labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS[args.dataset](args)
 
     if args.local_rank == 0:
