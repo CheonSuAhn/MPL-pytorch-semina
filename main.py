@@ -222,15 +222,15 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             avg_student_model.update_parameters(student_model)
 
         with amp.autocast(enabled=args.amp):
-            # compute the prediction of new student model on labeled images
             with torch.no_grad():
-                s_logits_l = student_model(images_l)
+                s_logits_l = student_model(images_l)  # compute the prediction of new student model on labeled images
             s_loss_l_new = F.cross_entropy(s_logits_l.detach(), targets)  # compute the loss on labeled image with new student model
             dot_product = s_loss_l_old - s_loss_l_new # approximate dot product using tylor series
             _, hard_pseudo_label = torch.max(t_logits_us.detach(), dim=-1)  # generate hard pseudo label from teacher's predictions by using max sampling
             t_loss_mpl = dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label)  # compute the MPL loss
             t_loss = t_loss_uda + t_loss_mpl
-
+        
+        # update the teacher's parameter using three losses (MPL + UDA + finetuning)
         t_scaler.scale(t_loss).backward()
         if args.grad_clip > 0:
             t_scaler.unscale_(t_optimizer)
@@ -328,7 +328,7 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         args.writer.add_scalar("result/test_acc@1", args.best_top1)
         wandb.log({"result/test_acc@1": args.best_top1})
         
-    # additionally finetune with best teacher model on labeled data
+    # additionally finetune with best student model on labeled data
     del t_scaler, t_scheduler, t_optimizer, teacher_model, unlabeled_loader
     del s_scaler, s_scheduler, s_optimizer
     ckpt_name = f'{args.save_path}/{args.name}_best.pth.tar'
@@ -376,7 +376,7 @@ def evaluate(args, test_loader, model, criterion):
         test_iter.close()
         return losses.avg, top1.avg, top5.avg
 
-# finetune with trained teacher model on labeled data
+# finetune with trained student model on labeled data
 def finetune(args, train_loader, test_loader, model, criterion):
     train_sampler = RandomSampler if args.local_rank == -1 else DistributedSampler
     labeled_loader = DataLoader(
