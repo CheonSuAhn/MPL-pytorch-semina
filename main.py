@@ -440,11 +440,13 @@ def finetune(args, train_loader, test_loader, model, criterion):
     return
 
 
-def main():
+def main(): 
+    # argument setting
     args = parser.parse_args()
     args.best_top1 = 0.
     args.best_top5 = 0.
-
+    
+    # multi-gpu setting
     if args.local_rank != -1:
         args.gpu = args.local_rank
         torch.distributed.init_process_group(backend='nccl')
@@ -452,7 +454,8 @@ def main():
     else:
         args.gpu = 0
         args.world_size = 1
-
+        
+    # device setting
     args.device = torch.device('cuda', args.gpu)
 
     logging.basicConfig(
@@ -477,12 +480,14 @@ def main():
 
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
-
+    
+    # Dataset setting
     labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS[args.dataset](args)
 
     if args.local_rank == 0:
         torch.distributed.barrier()
-
+        
+    # setting labeled & unlabeled dataloader for training
     train_sampler = RandomSampler if args.local_rank == -1 else DistributedSampler
     labeled_loader = DataLoader(
         labeled_dataset,
@@ -497,12 +502,14 @@ def main():
         batch_size=args.batch_size*args.mu,
         num_workers=args.workers,
         drop_last=True)
-
+    
+    # test loader setting
     test_loader = DataLoader(test_dataset,
                              sampler=SequentialSampler(test_dataset),
                              batch_size=args.batch_size,
                              num_workers=args.workers)
-
+    
+    # setting depth and widen_factor according to dataset
     if args.dataset == "cifar10":
         depth, widen_factor = 28, 2
     elif args.dataset == 'cifar100':
@@ -510,7 +517,8 @@ def main():
 
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
-
+    
+    # setting the teacher and student network : WideResNet
     teacher_model = WideResNet(num_classes=args.num_classes,
                                depth=depth,
                                widen_factor=widen_factor,
@@ -527,15 +535,19 @@ def main():
 
     logger.info(f"Model: WideResNet {depth}x{widen_factor}")
     logger.info(f"Params: {sum(p.numel() for p in teacher_model.parameters())/1e6:.2f}M")
-
+    
+    # move the model to device(GPU)
     teacher_model.to(args.device)
     student_model.to(args.device)
     avg_student_model = None
+    # setting avg stdent model to be optimized by EMA(exponetial moving average) if args.ema = 1
     if args.ema > 0:
         avg_student_model = ModelEMA(student_model, args.ema)
-
+        
+    # loss setting. default setting is nn.CrossEntropyLoss(). if applying label_smoothing, loss is SmoothCrossEntropy 
     criterion = create_loss_fn(args)
-
+    
+    # weight decay setting for teacher and student model
     no_decay = ['bn']
     teacher_parameters = [
         {'params': [p for n, p in teacher_model.named_parameters() if not any(
@@ -549,7 +561,8 @@ def main():
         {'params': [p for n, p in student_model.named_parameters() if any(
             nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-
+    
+    # SGD optimizer for teacher and student model
     t_optimizer = optim.SGD(teacher_parameters,
                             lr=args.teacher_lr,
                             momentum=args.momentum,
@@ -560,7 +573,8 @@ def main():
                             momentum=args.momentum,
                             # weight_decay=args.weight_decay,
                             nesterov=args.nesterov)
-
+    
+    # cosine scheduling with warmup for learning rate
     t_scheduler = get_cosine_schedule_with_warmup(t_optimizer,
                                                   args.warmup_steps,
                                                   args.total_steps)
@@ -568,7 +582,7 @@ def main():
                                                   args.warmup_steps,
                                                   args.total_steps,
                                                   args.student_wait_steps)
-
+    # dynamic scaling for mixed precision by using amp module
     t_scaler = amp.GradScaler(enabled=args.amp)
     s_scaler = amp.GradScaler(enabled=args.amp)
 
@@ -601,7 +615,8 @@ def main():
             logger.info(f"=> loaded checkpoint '{args.resume}' (step {checkpoint['step']})")
         else:
             logger.info(f"=> no checkpoint found at '{args.resume}'")
-
+    
+    # setting the model in the multi-gpu environment
     if args.local_rank != -1:
         teacher_model = nn.parallel.DistributedDataParallel(
             teacher_model, device_ids=[args.local_rank],
@@ -609,21 +624,25 @@ def main():
         student_model = nn.parallel.DistributedDataParallel(
             student_model, device_ids=[args.local_rank],
             output_device=args.local_rank, find_unused_parameters=True)
-
+    
+    # finetuning with the student model on the labeled dataset
     if args.finetune:
         del t_scaler, t_scheduler, t_optimizer, teacher_model, unlabeled_loader
         del s_scaler, s_scheduler, s_optimizer
         finetune(args, labeled_loader, test_loader, student_model, criterion)
         return
-
+    
+    # evaluate on the test dataset with the student model
     if args.evaluate:
         del t_scaler, t_scheduler, t_optimizer, teacher_model, unlabeled_loader, labeled_loader
         del s_scaler, s_scheduler, s_optimizer
         evaluate(args, test_loader, student_model, criterion)
         return
-
+    
     teacher_model.zero_grad()
     student_model.zero_grad()
+    
+    # Meta Pseudo Labels training
     train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                teacher_model, student_model, avg_student_model, criterion,
                t_optimizer, s_optimizer, t_scheduler, s_scheduler, t_scaler, s_scaler)
