@@ -4,6 +4,7 @@ The official Tensorflow implementation is [here](https://github.com/google-resea
 
 ## 코드 리뷰 Code Review
 코드 리뷰를 위해 코드에 대해 주석을 달았습니다.
+
 I've added the comment about the code for the code review
 
 ## Results
